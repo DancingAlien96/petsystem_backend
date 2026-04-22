@@ -9,6 +9,7 @@ dotenv.config();
 const {
   PORT = 3000,
   ALLOWED_ORIGIN = 'http://localhost:3000',
+  RECAPTCHA_SECRET_KEY,
   SMTP_HOST,
   SMTP_PORT,
   SMTP_SECURE,
@@ -18,7 +19,7 @@ const {
   MONGODB_URI,
 } = process.env;
 
-if (!SMTP_HOST || !SMTP_PORT || !SMTP_USER || !SMTP_PASS || !MONGODB_URI) {
+if (!RECAPTCHA_SECRET_KEY || !SMTP_HOST || !SMTP_PORT || !SMTP_USER || !SMTP_PASS || !MONGODB_URI) {
   console.error('Faltan variables de entorno obligatorias. Revisa tu .env.');
   process.exit(1);
 }
@@ -49,45 +50,96 @@ const transporter = nodemailer.createTransport({
 
 const app = express();
 app.use(express.json());
-app.use(cors({ origin: ALLOWED_ORIGIN }));
 
-function buildAlertEmail({ owner, pet, alert, reporterPhone, reporterName }) {
-  const locationText = alert.location
-    ? `https://www.google.com/maps/search/?api=1&query=${alert.location.lat},${alert.location.lng}`
+const allowedOrigins = ALLOWED_ORIGIN ? ALLOWED_ORIGIN.split(",").map((origin) => origin.trim()) : [];
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error(`CORS: origin ${origin} not allowed`));
+      }
+    },
+  })
+);
+
+function buildAlertEmail({
+  toEmail,
+  subject,
+  location,
+  reporterPhone,
+  reporterName,
+  message,
+}) {
+  const locationText = location
+    ? `https://www.google.com/maps/search/?api=1&query=${location.lat},${location.lng}`
     : 'Ubicación no disponible';
 
-  return {
-    from: SMTP_USER,
-    to: owner.email || CONTACT_TO_EMAIL,
-    subject: `Alerta de extravío: ${pet.name}`,
-    text: `Hola ${owner.name || 'dueño'},
+  const text = message
+    ? `Hola,
 
-Se ha generado una nueva alerta de extravío para la mascota: ${pet.name}.
+Has recibido un nuevo mensaje relacionado con una mascota extraviada.
 
 Detalles:
-- Mascota: ${pet.name}
-- Tipo: ${pet.type || 'No especificado'}
 - Ubicación: ${locationText}
 - Reportado por: ${reporterName || 'Anónimo'}
 - Teléfono del reportero: ${reporterPhone || 'No proporcionado'}
-- Fecha: ${alert.createdAt.toISOString()}
+- Mensaje: ${message}
 
-Por favor, revisa el sistema para más información y coordina la recuperación.
-`,
+Por favor, responde al reportero para coordinar la recuperación.`
+    : `Hola,
+
+Se ha abierto la página de ubicación de la mascota perdida.
+
+Detalles:
+- Ubicación: ${locationText}
+- Reportado por: ${reporterName || 'Anónimo'}
+- Teléfono del reportero: ${reporterPhone || 'No proporcionado'}
+
+Por favor, revisa el asunto y coordina la búsqueda.`;
+
+  return {
+    from: SMTP_USER,
+    to: toEmail,
+    subject,
+    text,
     html: `
-      <p>Hola ${owner.name || 'dueño'},</p>
-      <p>Se ha generado una nueva alerta de extravío para la mascota <strong>${pet.name}</strong>.</p>
+      <p>Hola,</p>
+      <p>${message ? 'Has recibido un nuevo mensaje relacionado con una mascota extraviada.' : 'Se ha abierto la página de ubicación de la mascota perdida.'}</p>
       <ul>
-        <li><strong>Tipo:</strong> ${pet.type || 'No especificado'}</li>
-        <li><strong>Ubicación:</strong> ${locationText}</li>
+        <li><strong>Ubicación:</strong> <a href="${locationText}">${locationText}</a></li>
         <li><strong>Reportado por:</strong> ${reporterName || 'Anónimo'}</li>
         <li><strong>Teléfono del reportero:</strong> ${reporterPhone || 'No proporcionado'}</li>
-        <li><strong>Fecha:</strong> ${alert.createdAt.toISOString()}</li>
+        ${message ? `<li><strong>Mensaje:</strong> ${message}</li>` : ''}
       </ul>
       <p>Gracias,</p>
       <p>Equipo de PetSystem</p>
     `,
   };
+}
+
+async function verifyRecaptcha(token, remoteIp) {
+  if (!token) {
+    return false;
+  }
+
+  const params = new URLSearchParams({
+    secret: RECAPTCHA_SECRET_KEY,
+    response: token,
+  });
+
+  if (remoteIp) {
+    params.append('remoteip', remoteIp);
+  }
+
+  const response = await fetch('https://www.google.com/recaptcha/api/siteverify', {
+    method: 'POST',
+    body: params,
+  });
+
+  const result = await response.json();
+  return result.success === true;
 }
 
 async function sendAlertEmail(data) {
@@ -101,39 +153,21 @@ app.get('/', (req, res) => {
 
 app.post('/api/alerts/auto', async (req, res) => {
   try {
-    const { petId, reporterPhone, reporterName, location } = req.body;
+    const { reporterPhone, reporterName, location } = req.body;
 
-    if (!petId) {
-      return res.status(400).json({ error: 'petId es obligatorio' });
-    }
-
-    const pet = await Pet.findById(petId).populate('owner');
-    if (!pet) {
-      return res.status(404).json({ error: 'Mascota no encontrada' });
-    }
-
-    const owner = pet.owner;
-    if (!owner) {
-      return res.status(404).json({ error: 'Dueño no encontrado para esta mascota' });
-    }
-
-    const alert = await Alert.create({
-      pet: pet._id,
-      owner: owner._id,
+    const subject = 'Alerta automática de ubicación de mascota extraviada';
+    await sendAlertEmail({
+      toEmail: CONTACT_TO_EMAIL,
+      subject,
+      location: location || undefined,
       reporterPhone: reporterPhone || 'No proporcionado',
       reporterName: reporterName || 'Anónimo',
-      location: location || undefined,
-      status: 'new',
     });
-
-    await sendAlertEmail({ owner, pet, alert, reporterPhone, reporterName });
 
     return res.json({
       success: true,
       message: 'Correo enviado automáticamente al dueño',
-      alertId: alert._id,
-      ownerEmail: owner.email,
-      petName: pet.name,
+      ownerEmail: CONTACT_TO_EMAIL,
     });
   } catch (error) {
     console.error('Error en /api/alerts/auto:', error);
@@ -143,36 +177,34 @@ app.post('/api/alerts/auto', async (req, res) => {
 
 app.post('/api/alerts', async (req, res) => {
   try {
-    const { petId, reporterPhone, reporterName, location, message } = req.body;
+    const { reporterPhone, reporterName, location, message, recaptchaToken } = req.body;
 
-    if (!petId) {
-      return res.status(400).json({ error: 'petId es obligatorio' });
+    if (!recaptchaToken) {
+      return res.status(400).json({ error: 'Token de reCAPTCHA es obligatorio' });
     }
 
-    const pet = await Pet.findById(petId).populate('owner');
-    if (!pet) {
-      return res.status(404).json({ error: 'Mascota no encontrada' });
+    const recaptchaValid = await verifyRecaptcha(recaptchaToken, req.ip);
+    if (!recaptchaValid) {
+      return res.status(400).json({ error: 'Validación de reCAPTCHA fallida' });
     }
 
-    const owner = pet.owner;
-    if (!owner) {
-      return res.status(404).json({ error: 'Dueño no encontrado para esta mascota' });
+    if (!message || message.trim().length === 0) {
+      return res.status(400).json({ error: 'El mensaje es obligatorio' });
     }
 
-    const alert = await Alert.create({
-      pet: pet._id,
-      owner: owner._id,
+    const subject = 'Mensaje de alerta de mascota extraviada';
+    await sendAlertEmail({
+      toEmail: CONTACT_TO_EMAIL,
+      subject,
+      location: location || undefined,
       reporterPhone: reporterPhone || 'No proporcionado',
       reporterName: reporterName || 'Anónimo',
-      location: location || undefined,
-      message: message || '',
-      status: 'new',
+      message,
     });
 
     return res.json({
       success: true,
-      message: 'Alerta creada correctamente',
-      alertId: alert._id,
+      message: 'Mensaje enviado correctamente al dueño',
     });
   } catch (error) {
     console.error('Error en /api/alerts:', error);
