@@ -192,8 +192,15 @@ async function ensureAdminUser() {
 async function authenticateAdmin(user, pass) {
   const admin = await AdminUser.findOne({ username: user });
   if (!admin) {
+    if (user === ADMIN_USER && pass === ADMIN_PASS) {
+      const passwordHash = await bcrypt.hash(ADMIN_PASS, 10);
+      await AdminUser.create({ username: ADMIN_USER, passwordHash });
+      console.log(`Admin creado en MongoDB durante el primer login: ${ADMIN_USER}`);
+      return true;
+    }
     return false;
   }
+
   return bcrypt.compare(pass, admin.passwordHash);
 }
 
