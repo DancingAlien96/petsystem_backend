@@ -173,12 +173,18 @@ async function createUniqueSlug() {
 }
 
 async function ensureAdminUser() {
+  const passwordHash = await bcrypt.hash(ADMIN_PASS, 10);
   const existingAdmin = await AdminUser.findOne({ username: ADMIN_USER });
   if (existingAdmin) {
+    const passwordMatches = await bcrypt.compare(ADMIN_PASS, existingAdmin.passwordHash);
+    if (!passwordMatches) {
+      existingAdmin.passwordHash = passwordHash;
+      await existingAdmin.save();
+      console.log(`Contraseña del admin ${ADMIN_USER} sincronizada en MongoDB.`);
+    }
     return;
   }
 
-  const passwordHash = await bcrypt.hash(ADMIN_PASS, 10);
   await AdminUser.create({ username: ADMIN_USER, passwordHash });
   console.log(`Admin por defecto creado en Mongo: ${ADMIN_USER}`);
 }
